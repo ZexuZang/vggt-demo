@@ -110,6 +110,162 @@ def bilinear_sample_map(map2d, xy, src_hw):
     wa[same], wb[same], wc[same], wd[same] = 1.0, 0.0, 0.0, 0.0
     return (wa * map2d[y0, x0] + wb * map2d[y1, x0] + wc * map2d[y0, x1] + wd * map2d[y1, x1]).astype(np.float32)
 
+def apply_affine(M, pts):
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    pts_h = np.concatenate([pts.astype(np.float32), ones], axis=1)
+    return (pts_h @ M.T).astype(np.float32)
+
+
+def apply_homography(H, pts):
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    pts_h = np.concatenate([pts.astype(np.float32), ones], axis=1)
+    pred_h = pts_h @ H.T
+    z = pred_h[:, 2:3]
+    pred = pred_h[:, :2] / np.maximum(z, 1e-6)
+    return pred.astype(np.float32)
+
+
+def estimate_background_motion_residual(
+    tracks,
+    visibility,
+    point_motion_score,
+    bg_model="affine",
+    ransac_thresh=3.0,
+    static_candidate_percentile=45.0,
+    min_bg_points=80,
+    vis_thresh=0.5,
+):
+    """
+    Estimate how well each CoTracker point follows the static background motion.
+
+    tracks: T, N, 2
+    visibility: T, N
+    point_motion_score: N, Any4D scene-flow score sampled at reference points
+
+    Return:
+        bg_residual_px: N
+        bg_residual_score: N, normalized to [0, 1]
+        per_frame_residual: T, N
+        bg_model_success: T
+    """
+    tracks = tracks.astype(np.float32)
+    visibility = visibility.astype(np.float32)
+
+    T, N, _ = tracks.shape
+    ref_pts = tracks[0]
+    visible = visibility > vis_thresh
+
+    low_motion_cut = np.percentile(point_motion_score, static_candidate_percentile)
+    low_motion = point_motion_score <= low_motion_cut
+
+    per_frame_residual = np.full((T, N), np.nan, dtype=np.float32)
+    bg_model_success = np.zeros((T,), dtype=np.uint8)
+
+    per_frame_residual[0] = 0.0
+    bg_model_success[0] = 1
+
+    for t in range(1, T):
+        # Prefer low Any4D-motion points as static background candidates.
+        cand = low_motion & visible[0] & visible[t]
+
+        # Fallback if too few candidates.
+        if int(cand.sum()) < min_bg_points:
+            cand = visible[0] & visible[t]
+
+        if int(cand.sum()) < 8:
+            print(f"[BGResidual] Frame {t}: too few points, skipped. candidates={int(cand.sum())}")
+            continue
+
+        src = ref_pts[cand].astype(np.float32)
+        dst = tracks[t, cand].astype(np.float32)
+
+        try:
+            if bg_model == "affine":
+                M, inliers = cv2.estimateAffinePartial2D(
+                    src,
+                    dst,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=ransac_thresh,
+                    maxIters=2000,
+                    confidence=0.99,
+                    refineIters=10,
+                )
+                if M is None:
+                    print(f"[BGResidual] Frame {t}: affine estimation failed.")
+                    continue
+
+                pred = apply_affine(M.astype(np.float32), ref_pts)
+
+            elif bg_model == "homography":
+                H, inliers = cv2.findHomography(
+                    src,
+                    dst,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=ransac_thresh,
+                    maxIters=2000,
+                    confidence=0.99,
+                )
+                if H is None:
+                    print(f"[BGResidual] Frame {t}: homography estimation failed.")
+                    continue
+
+                pred = apply_homography(H.astype(np.float32), ref_pts)
+
+            else:
+                raise ValueError(f"Unknown bg_model: {bg_model}")
+
+        except cv2.error as e:
+            print(f"[BGResidual] Frame {t}: OpenCV error: {e}")
+            continue
+
+        res = np.linalg.norm(pred - tracks[t], axis=1).astype(np.float32)
+        res[~(visible[0] & visible[t])] = np.nan
+
+        per_frame_residual[t] = res
+        bg_model_success[t] = 1
+
+        if inliers is not None:
+            inlier_ratio = float(np.asarray(inliers).reshape(-1).mean())
+        else:
+            inlier_ratio = -1.0
+
+        print(
+            f"[BGResidual] Frame {t}: model={bg_model}, "
+            f"candidates={int(cand.sum())}, "
+            f"inlier_ratio={inlier_ratio:.3f}, "
+            f"median_res={np.nanmedian(res):.3f}px"
+        )
+
+    with np.errstate(all="ignore"):
+        bg_residual_px = np.nanmedian(per_frame_residual[1:], axis=0).astype(np.float32)
+
+    bg_residual_px = np.nan_to_num(bg_residual_px, nan=0.0, posinf=0.0, neginf=0.0)
+    bg_residual_score = robust_normalize(bg_residual_px, p_low=50.0, p_high=95.0)
+
+    return bg_residual_px, bg_residual_score, per_frame_residual, bg_model_success
+
+
+def draw_score_overlay(img_bgr, points_xy, scores, radius=3):
+    """
+    Visualize per-point scalar score.
+    Low score = blue/green, high score = red.
+    """
+    out = img_bgr.copy()
+    scores = np.clip(scores.astype(np.float32), 0.0, 1.0)
+
+    for (x, y), s in zip(points_xy, scores):
+        x_i = int(round(x))
+        y_i = int(round(y))
+
+        if x_i < 0 or x_i >= out.shape[1] or y_i < 0 or y_i >= out.shape[0]:
+            continue
+
+        color_val = np.array([[int(round(s * 255))]], dtype=np.uint8)
+        color = cv2.applyColorMap(color_val, cv2.COLORMAP_JET)[0, 0].tolist()
+
+        cv2.circle(out, (x_i, y_i), radius, color, -1, lineType=cv2.LINE_AA)
+
+    return out
 
 def save_gray(path, x):
     x = np.clip(x, 0, 1)
@@ -228,7 +384,17 @@ def main():
     parser.add_argument("--aggregate", choices=["max", "mean", "median"], default="max")
     parser.add_argument("--point_dynamic_thresh", type=float, default=0.55)
     parser.add_argument("--min_visible_ratio", type=float, default=0.35)
+    # Background motion residual filtering.
+    parser.add_argument("--use_bg_motion_residual", action="store_true")
+    parser.add_argument("--bg_model", choices=["affine", "homography"], default="affine")
+    parser.add_argument("--bg_ransac_thresh", type=float, default=3.0)
+    parser.add_argument("--bg_static_candidate_percentile", type=float, default=45.0)
+    parser.add_argument("--bg_min_points", type=int, default=80)
+    parser.add_argument("--bg_vis_thresh", type=float, default=0.5)
+    parser.add_argument("--bg_residual_score_thresh", type=float, default=0.45)
+    parser.add_argument("--bg_residual_px_thresh", type=float, default=2.0)
     parser.add_argument("--point_radius", type=int, default=18)
+    parser.add_argument("--point_vis_radius", type=int, default=3)
     parser.add_argument("--blur_sigma", type=float, default=7.0)
     parser.add_argument("--mask_thresh", type=float, default=0.35)
     parser.add_argument("--combine_with_prior", choices=["none", "max", "mean"], default="max")
@@ -262,17 +428,96 @@ def main():
         point_prior_score = np.zeros_like(point_motion_score)
 
     visible_ratio = visibility.mean(axis=0).astype(np.float32)
+
+    # ------------------------------------------------------------
+    # 1. Combine Any4D scene-flow score and optional prior score
+    # ------------------------------------------------------------
     point_dynamic_score = point_motion_score.copy()
+
     if prior is not None:
         if args.combine_with_prior == "max":
             point_dynamic_score = np.maximum(point_dynamic_score, point_prior_score)
         elif args.combine_with_prior == "mean":
             point_dynamic_score = 0.5 * point_dynamic_score + 0.5 * point_prior_score
 
-    point_dynamic_prob = point_dynamic_score * np.clip(visible_ratio / max(args.min_visible_ratio, 1e-6), 0.0, 1.0)
-    dynamic_labels = ((point_dynamic_prob >= args.point_dynamic_thresh) & (visible_ratio >= args.min_visible_ratio)).astype(np.uint8)
 
-    point_prob = rasterize_dynamic_points(initial_points, point_dynamic_prob, dynamic_labels, (track_h, track_w), args.point_radius, args.blur_sigma)
+    # ------------------------------------------------------------
+    # 2. Optional background motion residual
+    #    This filters points that have high Any4D score but still
+    #    follow the estimated static background motion.
+    # ------------------------------------------------------------
+    if args.use_bg_motion_residual:
+        bg_residual_px, bg_residual_score, per_frame_bg_residual, bg_model_success = (
+            estimate_background_motion_residual(
+                tracks=tracks,
+                visibility=visibility,
+                point_motion_score=point_dynamic_score,
+                bg_model=args.bg_model,
+                ransac_thresh=args.bg_ransac_thresh,
+                static_candidate_percentile=args.bg_static_candidate_percentile,
+                min_bg_points=args.bg_min_points,
+                vis_thresh=args.bg_vis_thresh,
+            )
+        )
+    else:
+        bg_residual_px = np.zeros_like(point_dynamic_score, dtype=np.float32)
+        bg_residual_score = np.ones_like(point_dynamic_score, dtype=np.float32)
+        per_frame_bg_residual = np.full(
+            (tracks.shape[0], tracks.shape[1]),
+            np.nan,
+            dtype=np.float32,
+        )
+        bg_model_success = np.zeros((tracks.shape[0],), dtype=np.uint8)
+
+
+    # ------------------------------------------------------------
+    # 3. Point-level dynamic decision
+    # ------------------------------------------------------------
+    visibility_weight = np.clip(
+        visible_ratio / max(args.min_visible_ratio, 1e-6),
+        0.0,
+        1.0,
+    )
+
+    if args.use_bg_motion_residual:
+        point_dynamic_prob = point_dynamic_score * visibility_weight * bg_residual_score
+    else:
+        point_dynamic_prob = point_dynamic_score * visibility_weight
+
+    point_dynamic_prob = np.clip(point_dynamic_prob, 0.0, 1.0).astype(np.float32)
+
+    scene_flow_condition = point_dynamic_score >= args.point_dynamic_thresh
+    visibility_condition = visible_ratio >= args.min_visible_ratio
+
+    if args.use_bg_motion_residual:
+        bg_condition = (
+            (bg_residual_score >= args.bg_residual_score_thresh)
+            & (bg_residual_px >= args.bg_residual_px_thresh)
+        )
+    else:
+        bg_condition = np.ones_like(scene_flow_condition, dtype=bool)
+
+    dynamic_labels = (
+        scene_flow_condition
+        & visibility_condition
+        & bg_condition
+    ).astype(np.uint8)
+
+
+    # ------------------------------------------------------------
+    # 4. Optional dense visualization/output
+    #    This part still makes a dense mask. If you want pure point-level
+    #    output, delete this block or set point_radius=0 and blur_sigma=0.
+    # ------------------------------------------------------------
+    point_prob = rasterize_dynamic_points(
+        initial_points,
+        point_dynamic_prob,
+        dynamic_labels,
+        (track_h, track_w),
+        args.point_radius,
+        args.blur_sigma,
+    )
+
     if prior is not None:
         if args.combine_with_prior == "max":
             dynamic_prob = np.maximum(point_prob, prior)
@@ -282,6 +527,7 @@ def main():
             dynamic_prob = point_prob
     else:
         dynamic_prob = point_prob
+
     dynamic_prob = np.clip(dynamic_prob, 0, 1)
     dynamic_mask = (dynamic_prob >= args.mask_thresh).astype(np.uint8)
 
@@ -306,12 +552,20 @@ def main():
         initial_points=initial_points.astype(np.float32),
         point_motion_score=point_motion_score.astype(np.float32),
         point_prior_score=point_prior_score.astype(np.float32),
+        point_dynamic_score=point_dynamic_score.astype(np.float32),
         visible_ratio=visible_ratio.astype(np.float32),
         point_dynamic_prob=point_dynamic_prob.astype(np.float32),
         dynamic_labels=dynamic_labels.astype(np.uint8),
         track_hw=np.array([track_h, track_w], dtype=np.int32),
         original_hw=np.array(first_orig_hw, dtype=np.int32),
         resize_scale=np.array(scale, dtype=np.float32),
+        bg_residual_px=bg_residual_px.astype(np.float32),
+        bg_residual_score=bg_residual_score.astype(np.float32),
+        per_frame_bg_residual=per_frame_bg_residual.astype(np.float32),
+        bg_model_success=bg_model_success.astype(np.uint8),
+        scene_flow_condition=scene_flow_condition.astype(np.uint8),
+        visibility_condition=visibility_condition.astype(np.uint8),
+        bg_condition=bg_condition.astype(np.uint8),
     )
 
     save_gray(out_dir / "cotracker_any4d_dynamic_probability.png", dynamic_prob)
@@ -322,6 +576,28 @@ def main():
     cv2.imwrite(str(out_dir / "cotracker_any4d_static_ba_overlay.png"), overlay_prob(ref_bgr, static_ba_mask.astype(np.float32), (0, 255, 0), 0.35))
     cv2.imwrite(str(out_dir / "representative_points_overlay.png"), draw_points_overlay(ref_bgr, initial_points, dynamic_labels, point_dynamic_prob))
     cv2.imwrite(str(out_dir / "dynamic_tracks_overlay.png"), draw_track_overlay(ref_bgr, tracks, dynamic_labels))
+
+    any4d_score_overlay = draw_score_overlay(
+        ref_bgr,
+        initial_points,
+        point_motion_score,
+        radius=args.point_vis_radius,
+    )
+    cv2.imwrite(
+        str(out_dir / "point_any4d_motion_score_overlay.png"),
+        any4d_score_overlay,
+    )
+
+    bg_residual_overlay = draw_score_overlay(
+        ref_bgr,
+        initial_points,
+        bg_residual_score,
+        radius=args.point_vis_radius,
+    )
+    cv2.imwrite(
+        str(out_dir / "point_bg_residual_score_overlay.png"),
+        bg_residual_overlay,
+    )
 
     if scale != 1.0:
         orig_ref = cv2.imread(str(paths[0]), cv2.IMREAD_COLOR)
@@ -353,6 +629,18 @@ def main():
         "blur_sigma": args.blur_sigma,
         "mask_thresh": args.mask_thresh,
         "combine_with_prior": args.combine_with_prior,
+        "num_scene_flow_high_points": int(scene_flow_condition.sum()),
+        "num_bg_residual_high_points": int(bg_condition.sum()),
+        "mean_bg_residual_px": float(bg_residual_px.mean()),
+        "mean_bg_residual_score": float(bg_residual_score.mean()),
+        "use_bg_motion_residual": bool(args.use_bg_motion_residual),
+        "bg_model": args.bg_model,
+        "bg_ransac_thresh": args.bg_ransac_thresh,
+        "bg_static_candidate_percentile": args.bg_static_candidate_percentile,
+        "bg_min_points": args.bg_min_points,
+        "bg_residual_score_thresh": args.bg_residual_score_thresh,
+        "bg_residual_px_thresh": args.bg_residual_px_thresh,
+        "bg_model_success_frames": int(bg_model_success.sum()),
     }
     (out_dir / "cotracker_any4d_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
