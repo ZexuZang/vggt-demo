@@ -134,6 +134,7 @@ def estimate_background_motion_residual(
     static_candidate_percentile=45.0,
     min_bg_points=80,
     vis_thresh=0.5,
+    residual_reduce="median",
 ):
     """
     Estimate how well each CoTracker point follows the static background motion.
@@ -236,8 +237,15 @@ def estimate_background_motion_residual(
             f"median_res={np.nanmedian(res):.3f}px"
         )
 
+    valid_res = per_frame_residual[1:]
+
     with np.errstate(all="ignore"):
-        bg_residual_px = np.nanmedian(per_frame_residual[1:], axis=0).astype(np.float32)
+        if residual_reduce == "max":
+            bg_residual_px = np.nanmax(valid_res, axis=0).astype(np.float32)
+        elif residual_reduce == "p90":
+            bg_residual_px = np.nanpercentile(valid_res, 90, axis=0).astype(np.float32)
+        else:
+            bg_residual_px = np.nanmedian(valid_res, axis=0).astype(np.float32)
 
     bg_residual_px = np.nan_to_num(bg_residual_px, nan=0.0, posinf=0.0, neginf=0.0)
     bg_residual_score = robust_normalize(bg_residual_px, p_low=50.0, p_high=95.0)
@@ -744,6 +752,31 @@ def depth_aware_connected_component_filter(
 
     return refined_labels.astype(np.uint8), component_ids, component_valid
 
+def sample_any4d_motion_score_per_frame(
+    scene_flow_list,   # list of [H,W,3] or np.array [T,H,W,3]
+    tracks,            # [T,N,2]
+    visibility,        # [T,N]
+):
+    T, N, _ = tracks.shape
+    per_frame_score = np.zeros((T, N), dtype=np.float32)
+
+    for t in range(1, T):
+        flow = scene_flow_list[t]               # [H,W,3]
+        flow_mag = np.linalg.norm(flow, axis=-1)
+        flow_score_map = robust_normalize(flow_mag, p_low=50.0, p_high=95.0)
+
+        sampled = bilinear_sample_map(
+            flow_score_map,
+            tracks[t],
+            src_hw=flow_score_map.shape[:2],
+        )
+
+        sampled[visibility[t] <= 0] = 0.0
+        per_frame_score[t] = sampled.astype(np.float32)
+
+    agg_score = np.nanmax(per_frame_score[1:], axis=0).astype(np.float32)
+    return agg_score, per_frame_score
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
@@ -792,6 +825,17 @@ def main():
     parser.add_argument("--bg_vis_thresh", type=float, default=0.5)
     parser.add_argument("--bg_residual_score_thresh", type=float, default=0.45)
     parser.add_argument("--bg_residual_px_thresh", type=float, default=2.0)
+    # Temporal OR dynamic decision.
+    parser.add_argument("--use_temporal_or", action="store_true")
+    parser.add_argument("--temporal_min_bg_frames", type=int, default=1)
+    parser.add_argument("--temporal_min_visible_frames", type=int, default=2)
+    parser.add_argument("--temporal_bg_px_thresh", type=float, default=None)
+    parser.add_argument("--temporal_any4d_thresh", type=float, default=0.35)
+    parser.add_argument(
+        "--bg_residual_reduce",
+        choices=["median", "max", "p90"],
+        default="median",
+    )
     parser.add_argument("--point_radius", type=int, default=18)
     parser.add_argument("--point_vis_radius", type=int, default=3)
     parser.add_argument("--blur_sigma", type=float, default=7.0)
@@ -799,6 +843,27 @@ def main():
     parser.add_argument("--combine_with_prior", choices=["none", "max", "mean"], default="max")
     parser.add_argument("--static_weight_thresh", type=float, default=0.45)
     parser.add_argument("--device", default="cuda")
+
+    # score fusion
+    parser.add_argument("--w_any4d", type=float, default=0.60)
+    parser.add_argument("--w_bg", type=float, default=0.30)
+    parser.add_argument("--w_vggt", type=float, default=0.10)
+
+    # temporal fusion
+    parser.add_argument("--use_temporal_fusion", action="store_true")
+    parser.add_argument("--temporal_topk", type=int, default=2)
+    parser.add_argument("--temporal_frame_score_thresh", type=float, default=0.45)
+    parser.add_argument("--temporal_min_active_frames", type=int, default=1)
+
+    parser.add_argument("--w_temporal_peak", type=float, default=0.50)
+    parser.add_argument("--w_temporal_topk", type=float, default=0.30)
+    parser.add_argument("--w_temporal_active", type=float, default=0.20)
+
+    parser.add_argument("--w_base", type=float, default=0.55)
+    parser.add_argument("--w_temporal", type=float, default=0.45)
+
+    parser.add_argument("--final_dynamic_thresh", type=float, default=0.50)
+
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -926,6 +991,7 @@ def main():
                 static_candidate_percentile=args.bg_static_candidate_percentile,
                 min_bg_points=args.bg_min_points,
                 vis_thresh=args.bg_vis_thresh,
+                residual_reduce=args.bg_residual_reduce,
             )
         )
     else:
@@ -940,37 +1006,142 @@ def main():
 
 
     # ------------------------------------------------------------
-    # 3. Point-level dynamic decision
+    # 3. Point-level dynamic decision with temporal keep-alive
     # ------------------------------------------------------------
+
+    # 3.1 Visibility support
+    visible_ratio = visibility.mean(axis=0).astype(np.float32)
+
     visibility_weight = np.clip(
         visible_ratio / max(args.min_visible_ratio, 1e-6),
         0.0,
         1.0,
     )
 
-    if args.use_bg_motion_residual:
-        point_dynamic_prob = point_dynamic_score * visibility_weight * bg_residual_score
-    else:
-        point_dynamic_prob = point_dynamic_score * visibility_weight
-
-    point_dynamic_prob = np.clip(point_dynamic_prob, 0.0, 1.0).astype(np.float32)
-
-    scene_flow_condition = point_dynamic_score >= args.point_dynamic_thresh
     visibility_condition = visible_ratio >= args.min_visible_ratio
 
+    if args.use_temporal_or:
+        visible_frame_count = (visibility > args.bg_vis_thresh).sum(axis=0)
+        visibility_condition = visibility_condition | (
+            visible_frame_count >= args.temporal_min_visible_frames
+        )
+    else:
+        visible_frame_count = (visibility > args.bg_vis_thresh).sum(axis=0)
+
+
+    # 3.2 Background residual condition
     if args.use_bg_motion_residual:
-        bg_condition = (
+        bg_condition_base = (
             (bg_residual_score >= args.bg_residual_score_thresh)
             & (bg_residual_px >= args.bg_residual_px_thresh)
         )
-    else:
-        bg_condition = np.ones_like(scene_flow_condition, dtype=bool)
 
-    dynamic_labels = (
+        residual_valid = np.nan_to_num(
+            per_frame_bg_residual[1:],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        temporal_bg_px_thresh = (
+            args.temporal_bg_px_thresh
+            if args.temporal_bg_px_thresh is not None
+            else args.bg_residual_px_thresh
+        )
+
+        # 每个点有多少帧出现明显 background residual
+        bg_active_count = (residual_valid >= temporal_bg_px_thresh).sum(axis=0)
+
+        # 只要某几帧明显动，就通过 temporal bg condition
+        if args.use_temporal_or:
+            bg_condition_temporal = bg_active_count >= args.temporal_min_bg_frames
+        else:
+            bg_condition_temporal = np.zeros_like(bg_condition_base, dtype=bool)
+
+        bg_condition = bg_condition_base | bg_condition_temporal
+
+        # temporal residual score，用 max residual 重新归一化
+        if args.use_temporal_or:
+            with np.errstate(all="ignore"):
+                bg_residual_px_temporal = np.nanmax(residual_valid, axis=0).astype(np.float32)
+
+            bg_residual_px_temporal = np.nan_to_num(
+                bg_residual_px_temporal,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            bg_residual_score_temporal = robust_normalize(
+                bg_residual_px_temporal,
+                p_low=50.0,
+                p_high=95.0,
+            )
+
+            bg_residual_score_used = np.maximum(
+                bg_residual_score,
+                bg_residual_score_temporal,
+            )
+        else:
+            bg_residual_px_temporal = np.zeros_like(bg_residual_px, dtype=np.float32)
+            bg_residual_score_temporal = np.zeros_like(bg_residual_score, dtype=np.float32)
+            bg_residual_score_used = bg_residual_score
+
+    else:
+        bg_condition_base = np.ones_like(point_dynamic_score, dtype=bool)
+        bg_condition_temporal = np.zeros_like(point_dynamic_score, dtype=bool)
+        bg_condition = np.ones_like(point_dynamic_score, dtype=bool)
+
+        bg_active_count = np.zeros_like(point_dynamic_score, dtype=np.int32)
+        bg_residual_px_temporal = np.zeros_like(point_dynamic_score, dtype=np.float32)
+        bg_residual_score_temporal = np.zeros_like(point_dynamic_score, dtype=np.float32)
+        bg_residual_score_used = np.ones_like(point_dynamic_score, dtype=np.float32)
+
+
+    # 3.3 Any4D scene-flow condition
+    scene_flow_condition = point_dynamic_score >= args.point_dynamic_thresh
+
+    # temporal rescue：给腿部这种弱 Any4D、但某几帧 residual 很强的点一次机会
+    temporal_scene_flow_condition = point_dynamic_score >= args.temporal_any4d_thresh
+
+
+    # 3.4 Final point-level probability
+    base_prob = point_dynamic_score * visibility_weight * bg_residual_score
+    temporal_prob = point_dynamic_score * visibility_weight * bg_residual_score_temporal
+
+    if args.use_temporal_or:
+        point_dynamic_prob = np.maximum(base_prob, temporal_prob)
+    else:
+        point_dynamic_prob = base_prob
+
+    point_dynamic_prob = np.clip(point_dynamic_prob, 0.0, 1.0).astype(np.float32)
+
+
+    # 3.5 Final dynamic labels
+    normal_dynamic_condition = (
         scene_flow_condition
         & visibility_condition
-        & bg_condition
+        & bg_condition_base
+    )
+
+    temporal_keep_condition = (
+        args.use_temporal_or
+        & temporal_scene_flow_condition
+        & visibility_condition
+        & bg_condition_temporal
+    )
+
+    dynamic_labels = (
+        normal_dynamic_condition
+        | temporal_keep_condition
     ).astype(np.uint8)
+
+    print(
+        "[TemporalOR] "
+        f"normal_dynamic={int(normal_dynamic_condition.sum())}, "
+        f"temporal_keep={int(temporal_keep_condition.sum())}, "
+        f"final_dynamic={int(dynamic_labels.sum())}"
+    )
 
     # ------------------------------------------------------------
     # 3.5 Optional depth-aware point connected component
@@ -1079,6 +1250,15 @@ def main():
         bg_residual_px=bg_residual_px.astype(np.float32),
         bg_residual_score=bg_residual_score.astype(np.float32),
         per_frame_bg_residual=per_frame_bg_residual.astype(np.float32),
+        bg_residual_px_temporal=bg_residual_px_temporal.astype(np.float32),
+        bg_residual_score_temporal=bg_residual_score_temporal.astype(np.float32),
+        bg_active_count=bg_active_count.astype(np.int32),
+        visible_frame_count=visible_frame_count.astype(np.int32),
+        normal_dynamic_condition=normal_dynamic_condition.astype(np.uint8),
+        temporal_keep_condition=temporal_keep_condition.astype(np.uint8),
+        bg_condition_base=bg_condition_base.astype(np.uint8),
+        bg_condition_temporal=bg_condition_temporal.astype(np.uint8),
+        bg_residual_score_used=bg_residual_score_used.astype(np.float32),
         bg_model_success=bg_model_success.astype(np.uint8),
         scene_flow_condition=scene_flow_condition.astype(np.uint8),
         visibility_condition=visibility_condition.astype(np.uint8),
@@ -1114,6 +1294,18 @@ def main():
     cv2.imwrite(
         str(out_dir / "point_bg_residual_score_overlay.png"),
         bg_residual_overlay,
+    )
+
+    temporal_bg_overlay = draw_score_overlay(
+        ref_bgr,
+        initial_points,
+        bg_residual_score_temporal,
+        radius=args.point_vis_radius,
+    )
+
+    cv2.imwrite(
+        str(out_dir / "point_temporal_bg_residual_score_overlay.png"),
+        temporal_bg_overlay,
     )
 
     if scale != 1.0:
@@ -1184,6 +1376,19 @@ def main():
         "num_dynamic_points_before_cc": int(dynamic_labels_before_cc.sum()),
         "num_dynamic_points_after_cc": int(dynamic_labels.sum()),
         "num_valid_depth_cc_points": int(depth_cc_valid.sum()),
+        "use_temporal_or": bool(args.use_temporal_or),
+        "temporal_any4d_thresh": args.temporal_any4d_thresh,
+        "temporal_min_bg_frames": args.temporal_min_bg_frames,
+        "temporal_min_visible_frames": args.temporal_min_visible_frames,
+        "temporal_bg_px_thresh": (
+            args.temporal_bg_px_thresh
+            if args.temporal_bg_px_thresh is not None
+            else args.bg_residual_px_thresh
+        ),
+        "num_normal_dynamic_points": int(normal_dynamic_condition.sum()),
+        "num_temporal_keep_points": int(temporal_keep_condition.sum()),
+        "mean_bg_active_count": float(bg_active_count.mean()),
+        "max_bg_active_count": int(bg_active_count.max()),
     }
     (out_dir / "cotracker_any4d_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
