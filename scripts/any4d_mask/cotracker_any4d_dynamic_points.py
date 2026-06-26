@@ -592,6 +592,7 @@ def depth_aware_connected_component_filter(
     min_dynamic_ratio=0.25,
     min_mean_score=0.45,
     propagate=False,
+    candidate_score_thresh=0.30,
 ):
     """
     Use VGGT depth to build point connected components.
@@ -614,6 +615,11 @@ def depth_aware_connected_component_filter(
     point_scores = point_scores.astype(np.float32)
     dynamic_labels = dynamic_labels.astype(np.uint8)
 
+    candidate_mask = (
+        (dynamic_labels > 0)
+        | (point_scores >= candidate_score_thresh)
+    )
+
     h, w = hw
     n = points_xy.shape[0]
 
@@ -627,6 +633,9 @@ def depth_aware_connected_component_filter(
     buckets = {}
 
     for i, (x, y) in enumerate(points_xy):
+        if not candidate_mask[i]:
+            continue
+
         if x < 0 or x >= w or y < 0 or y >= h:
             continue
 
@@ -649,12 +658,17 @@ def depth_aware_connected_component_filter(
 
             if not valid_depth[i]:
                 continue
+            if not candidate_mask[i]:
+                continue
 
             for j in neighbor_ids:
                 if j <= i:
                     continue
 
                 if not valid_depth[j]:
+                    continue
+
+                if not candidate_mask[j]:
                     continue
 
                 xj, yj = points_xy[j]
@@ -681,6 +695,9 @@ def depth_aware_connected_component_filter(
     # Collect components.
     root_to_ids = {}
     for i in range(n):
+        if not candidate_mask[i]:
+            continue
+
         r = uf.find(i)
         root_to_ids.setdefault(r, []).append(i)
 
@@ -757,6 +774,7 @@ def main():
     parser.add_argument("--min_visible_ratio", type=float, default=0.35)
     # Depth-aware point connected component.
     parser.add_argument("--use_depth_cc", action="store_true")
+    parser.add_argument("--cc_candidate_score_thresh", type=float, default=0.30)
     parser.add_argument("--cc_radius", type=float, default=18.0)
     parser.add_argument("--cc_depth_gate", type=float, default=0.25)
     parser.add_argument("--cc_score_gate", type=float, default=0.35)
@@ -975,7 +993,7 @@ def main():
         dynamic_labels, depth_cc_ids, depth_cc_valid = depth_aware_connected_component_filter(
             points_xy=initial_points,
             point_depth=point_depth,
-            point_scores=point_dynamic_prob,
+            point_scores=point_dynamic_score,
             dynamic_labels=dynamic_labels,
             hw=(track_h, track_w),
             radius=args.cc_radius,
@@ -986,6 +1004,7 @@ def main():
             min_dynamic_ratio=args.cc_min_dynamic_ratio,
             min_mean_score=args.cc_min_mean_score,
             propagate=args.cc_propagate,
+            candidate_score_thresh=args.cc_candidate_score_thresh,
         )
 
         print(
