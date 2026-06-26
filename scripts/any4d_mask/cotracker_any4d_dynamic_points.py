@@ -369,6 +369,363 @@ def run_cotracker(video_rgb, grid_size, device):
         vis = vis[..., 0]
     return tracks, vis
 
+def load_vggt_depth(vggt_npz, ref_idx=0):
+    if vggt_npz is None:
+        return None
+
+    data = np.load(vggt_npz, allow_pickle=True)
+
+    if "depth" not in data:
+        raise KeyError("VGGT npz must contain key: depth")
+
+    depth = data["depth"][ref_idx].astype(np.float32)
+
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    return depth
+
+
+def boxes_from_dynamic_points(points_xy, labels, hw, pad=40, link_radius=24, min_seed_points=3):
+    """
+    Build local resampling boxes from coarse dynamic points.
+
+    This mask is only used to make query boxes, not as final dynamic mask.
+    """
+    h, w = hw
+    marker = np.zeros((h, w), dtype=np.uint8)
+
+    dyn_pts = points_xy[labels > 0]
+
+    for x, y in dyn_pts:
+        x_i = int(round(x))
+        y_i = int(round(y))
+        if 0 <= x_i < w and 0 <= y_i < h:
+            cv2.circle(marker, (x_i, y_i), link_radius, 255, -1)
+
+    num, cc, stats, _ = cv2.connectedComponentsWithStats(marker, connectivity=8)
+
+    boxes = []
+    for i in range(1, num):
+        ys, xs = np.where(cc == i)
+        if len(xs) == 0:
+            continue
+
+        # Count how many dynamic seed points fall in this component.
+        x0_raw, y0_raw = xs.min(), ys.min()
+        x1_raw, y1_raw = xs.max(), ys.max()
+
+        in_comp = (
+            (dyn_pts[:, 0] >= x0_raw)
+            & (dyn_pts[:, 0] <= x1_raw)
+            & (dyn_pts[:, 1] >= y0_raw)
+            & (dyn_pts[:, 1] <= y1_raw)
+        )
+
+        if int(in_comp.sum()) < min_seed_points:
+            continue
+
+        x0 = max(0, int(x0_raw - pad))
+        y0 = max(0, int(y0_raw - pad))
+        x1 = min(w - 1, int(x1_raw + pad))
+        y1 = min(h - 1, int(y1_raw + pad))
+
+        boxes.append((x0, y0, x1, y1))
+
+    return boxes
+
+
+def make_local_query_points_from_boxes(
+    boxes,
+    step,
+    hw,
+    motion_score_map=None,
+    motion_gate=0.0,
+    depth_map=None,
+    seed_points=None,
+    seed_labels=None,
+    depth_gate=0.25,
+):
+    """
+    Generate local query points inside dynamic boxes.
+
+    Optional filters:
+    - motion_score_map gate
+    - VGGT depth consistency gate
+    """
+    h, w = hw
+    all_queries = []
+
+    for box in boxes:
+        x0, y0, x1, y1 = box
+
+        xs = np.arange(x0, x1 + 1, step, dtype=np.float32)
+        ys = np.arange(y0, y1 + 1, step, dtype=np.float32)
+
+        if len(xs) == 0 or len(ys) == 0:
+            continue
+
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        queries = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1).astype(np.float32)
+
+        # Motion gate: avoid sampling large static areas inside the box.
+        if motion_score_map is not None and motion_gate > 0:
+            motion_score_resized = resize_to(motion_score_map, hw, cv2.INTER_LINEAR)
+            q_motion = bilinear_sample_map(motion_score_resized, queries, src_hw=hw)
+            queries = queries[q_motion >= motion_gate]
+
+        # Depth gate: keep points close to dynamic seed depth.
+        if depth_map is not None and seed_points is not None and seed_labels is not None:
+            dyn_seed = seed_points[seed_labels > 0]
+
+            # Use seed points inside current box.
+            in_box = (
+                (dyn_seed[:, 0] >= x0)
+                & (dyn_seed[:, 0] <= x1)
+                & (dyn_seed[:, 1] >= y0)
+                & (dyn_seed[:, 1] <= y1)
+            )
+            dyn_seed_box = dyn_seed[in_box]
+
+            if len(dyn_seed_box) > 0 and len(queries) > 0:
+                depth_resized = resize_to(depth_map, hw, cv2.INTER_LINEAR)
+
+                seed_depth = bilinear_sample_map(depth_resized, dyn_seed_box, src_hw=hw)
+                seed_depth = seed_depth[seed_depth > 0]
+
+                if len(seed_depth) > 0:
+                    median_depth = np.median(seed_depth)
+
+                    q_depth = bilinear_sample_map(depth_resized, queries, src_hw=hw)
+                    rel_err = np.abs(q_depth - median_depth) / max(float(median_depth), 1e-6)
+
+                    queries = queries[(q_depth > 0) & (rel_err <= depth_gate)]
+
+        if len(queries) > 0:
+            all_queries.append(queries)
+
+    if not all_queries:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    queries = np.concatenate(all_queries, axis=0)
+
+    # Remove duplicate integer positions.
+    q_int = np.round(queries).astype(np.int32)
+    _, unique_idx = np.unique(q_int, axis=0, return_index=True)
+    queries = queries[np.sort(unique_idx)]
+
+    return queries.astype(np.float32)
+
+
+def run_cotracker_with_queries(video_rgb, query_xy, device):
+    """
+    Run CoTracker using explicit query points.
+
+    query_xy: N,2 in frame-0 pixel coordinates.
+    CoTracker query format is usually [t, x, y], with t=0.
+    """
+    if len(query_xy) == 0:
+        return None, None
+
+    frames = np.stack(video_rgb, axis=0)
+    video = torch.from_numpy(frames).permute(0, 3, 1, 2)[None].float().to(device)
+
+    print("[CoTracker] Loading cotracker3_offline for local queries")
+    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
+    cotracker.eval()
+
+    t0 = np.zeros((query_xy.shape[0], 1), dtype=np.float32)
+    queries = np.concatenate([t0, query_xy.astype(np.float32)], axis=1)
+
+    queries_torch = torch.from_numpy(queries)[None].float().to(device)
+
+    print(f"[CoTracker] Running local queries: {queries_torch.shape[1]} points")
+
+    with torch.no_grad():
+        pred_tracks, pred_visibility = cotracker(video, queries=queries_torch)
+
+    tracks = pred_tracks[0].detach().float().cpu().numpy()
+    vis = pred_visibility[0].detach().float().cpu().numpy()
+
+    if vis.ndim == 3 and vis.shape[-1] == 1:
+        vis = vis[..., 0]
+
+    return tracks, vis
+
+class UnionFind:
+    def __init__(self, n):
+        self.parent = np.arange(n, dtype=np.int32)
+        self.size = np.ones(n, dtype=np.int32)
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra = self.find(a)
+        rb = self.find(b)
+
+        if ra == rb:
+            return
+
+        if self.size[ra] < self.size[rb]:
+            ra, rb = rb, ra
+
+        self.parent[rb] = ra
+        self.size[ra] += self.size[rb]
+
+
+def depth_aware_connected_component_filter(
+    points_xy,
+    point_depth,
+    point_scores,
+    dynamic_labels,
+    hw,
+    radius=18.0,
+    depth_gate=0.25,
+    score_gate=0.35,
+    min_component_points=3,
+    min_dynamic_points=2,
+    min_dynamic_ratio=0.25,
+    min_mean_score=0.45,
+    propagate=False,
+):
+    """
+    Use VGGT depth to build point connected components.
+
+    Two points are connected if:
+        1. their 2D distance is small;
+        2. their VGGT depth is similar;
+        3. their dynamic scores are similar.
+
+    If propagate=False:
+        Keep only original dynamic points that belong to valid depth-aware components.
+        This is good for removing false positive red points.
+
+    If propagate=True:
+        Mark all points inside valid depth-aware components as dynamic.
+        This is good for recovering feet / wheels / thin structures.
+    """
+    points_xy = points_xy.astype(np.float32)
+    point_depth = point_depth.astype(np.float32)
+    point_scores = point_scores.astype(np.float32)
+    dynamic_labels = dynamic_labels.astype(np.uint8)
+
+    h, w = hw
+    n = points_xy.shape[0]
+
+    if n == 0:
+        return dynamic_labels, np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.uint8)
+
+    uf = UnionFind(n)
+
+    # Spatial hash grid for efficient neighbor search.
+    cell_size = max(1, int(round(radius)))
+    buckets = {}
+
+    for i, (x, y) in enumerate(points_xy):
+        if x < 0 or x >= w or y < 0 or y >= h:
+            continue
+
+        cx = int(x // cell_size)
+        cy = int(y // cell_size)
+        buckets.setdefault((cx, cy), []).append(i)
+
+    valid_depth = np.isfinite(point_depth) & (point_depth > 0)
+
+    for (cx, cy), ids in buckets.items():
+        neighbor_ids = []
+
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                neighbor_ids.extend(buckets.get((cx + dx, cy + dy), []))
+
+        for i in ids:
+            xi, yi = points_xy[i]
+            di = point_depth[i]
+
+            if not valid_depth[i]:
+                continue
+
+            for j in neighbor_ids:
+                if j <= i:
+                    continue
+
+                if not valid_depth[j]:
+                    continue
+
+                xj, yj = points_xy[j]
+                dj = point_depth[j]
+
+                dist_2d = np.sqrt((xi - xj) ** 2 + (yi - yj) ** 2)
+
+                if dist_2d > radius:
+                    continue
+
+                depth_denom = max((float(di) + float(dj)) * 0.5, 1e-6)
+                rel_depth_diff = abs(float(di) - float(dj)) / depth_denom
+
+                if rel_depth_diff > depth_gate:
+                    continue
+
+                score_diff = abs(float(point_scores[i]) - float(point_scores[j]))
+
+                if score_gate >= 0 and score_diff > score_gate:
+                    continue
+
+                uf.union(i, j)
+
+    # Collect components.
+    root_to_ids = {}
+    for i in range(n):
+        r = uf.find(i)
+        root_to_ids.setdefault(r, []).append(i)
+
+    refined_labels = np.zeros_like(dynamic_labels)
+    component_ids = np.full((n,), -1, dtype=np.int32)
+    component_valid = np.zeros((n,), dtype=np.uint8)
+
+    comp_idx = 0
+
+    for _, ids in root_to_ids.items():
+        ids = np.asarray(ids, dtype=np.int32)
+
+        for idx in ids:
+            component_ids[idx] = comp_idx
+
+        comp_idx += 1
+
+        if len(ids) < min_component_points:
+            continue
+
+        dyn_count = int(dynamic_labels[ids].sum())
+        dyn_ratio = dyn_count / max(len(ids), 1)
+        mean_score = float(point_scores[ids].mean())
+
+        is_valid_dynamic_component = (
+            (dyn_count >= min_dynamic_points)
+            and (
+                dyn_ratio >= min_dynamic_ratio
+                or mean_score >= min_mean_score
+            )
+        )
+
+        if not is_valid_dynamic_component:
+            continue
+
+        component_valid[ids] = 1
+
+        if propagate:
+            # Recover weak dynamic points inside the same depth-consistent component.
+            refined_labels[ids] = 1
+        else:
+            # Conservative mode: only keep original dynamic points in valid components.
+            refined_labels[ids] = dynamic_labels[ids]
+
+    return refined_labels.astype(np.uint8), component_ids, component_valid
 
 def main():
     parser = argparse.ArgumentParser()
@@ -382,8 +739,32 @@ def main():
     parser.add_argument("--resize_max_side", type=int, default=768)
     parser.add_argument("--grid_size", type=int, default=35)
     parser.add_argument("--aggregate", choices=["max", "mean", "median"], default="max")
+    # Local dynamic-region re-sampling.
+    parser.add_argument("--local_resample", action="store_true")
+    parser.add_argument("--local_step", type=int, default=6)
+    parser.add_argument("--local_pad", type=int, default=40)
+    parser.add_argument("--local_link_radius", type=int, default=24)
+    parser.add_argument("--local_min_seed_points", type=int, default=3)
+    parser.add_argument("--local_max_queries", type=int, default=2500)
+    parser.add_argument("--local_seed_thresh", type=float, default=0.55)
+    parser.add_argument("--local_motion_gate", type=float, default=0.20)
+
+    # Optional VGGT depth gate for local query points.
+    parser.add_argument("--vggt_npz", default=None)
+    parser.add_argument("--vggt_ref_idx", type=int, default=0)
+    parser.add_argument("--local_depth_gate", type=float, default=0.25)
     parser.add_argument("--point_dynamic_thresh", type=float, default=0.55)
     parser.add_argument("--min_visible_ratio", type=float, default=0.35)
+    # Depth-aware point connected component.
+    parser.add_argument("--use_depth_cc", action="store_true")
+    parser.add_argument("--cc_radius", type=float, default=18.0)
+    parser.add_argument("--cc_depth_gate", type=float, default=0.25)
+    parser.add_argument("--cc_score_gate", type=float, default=0.35)
+    parser.add_argument("--cc_min_component_points", type=int, default=3)
+    parser.add_argument("--cc_min_dynamic_points", type=int, default=2)
+    parser.add_argument("--cc_min_dynamic_ratio", type=float, default=0.25)
+    parser.add_argument("--cc_min_mean_score", type=float, default=0.45)
+    parser.add_argument("--cc_propagate", action="store_true")
     # Background motion residual filtering.
     parser.add_argument("--use_bg_motion_residual", action="store_true")
     parser.add_argument("--bg_model", choices=["affine", "homography"], default="affine")
@@ -418,6 +799,76 @@ def main():
     motion_mag, motion_key = load_any4d_motion_map(args.any4d_npz, args.aggregate)
     motion_score_map = robust_normalize(motion_mag)
     point_motion_score = bilinear_sample_map(motion_score_map, initial_points, src_hw=(track_h, track_w))
+
+    # ------------------------------------------------------------
+    # Optional local dynamic-region re-sampling
+    # ------------------------------------------------------------
+    if args.local_resample:
+        print("[LocalResample] Building preliminary dynamic seed points")
+
+        prelim_score = point_motion_score.copy()
+        prelim_visible_ratio = visibility.mean(axis=0).astype(np.float32)
+
+        prelim_labels = (
+            (prelim_score >= args.local_seed_thresh)
+            & (prelim_visible_ratio >= args.min_visible_ratio)
+        ).astype(np.uint8)
+
+        boxes = boxes_from_dynamic_points(
+            initial_points,
+            prelim_labels,
+            hw=(track_h, track_w),
+            pad=args.local_pad,
+            link_radius=args.local_link_radius,
+            min_seed_points=args.local_min_seed_points,
+        )
+
+        print(f"[LocalResample] Found {len(boxes)} local dynamic boxes: {boxes}")
+
+        vggt_depth = load_vggt_depth(args.vggt_npz, args.vggt_ref_idx) if args.vggt_npz else None
+
+        local_queries = make_local_query_points_from_boxes(
+            boxes=boxes,
+            step=args.local_step,
+            hw=(track_h, track_w),
+            motion_score_map=motion_score_map,
+            motion_gate=args.local_motion_gate,
+            depth_map=vggt_depth,
+            seed_points=initial_points,
+            seed_labels=prelim_labels,
+            depth_gate=args.local_depth_gate,
+        )
+
+        if len(local_queries) > args.local_max_queries:
+            rng = np.random.default_rng(0)
+            keep = rng.choice(len(local_queries), args.local_max_queries, replace=False)
+            local_queries = local_queries[keep]
+
+        print(f"[LocalResample] Local query points after filters: {len(local_queries)}")
+
+        if len(local_queries) > 0:
+            local_tracks, local_visibility = run_cotracker_with_queries(
+                rgb_frames,
+                local_queries,
+                device,
+            )
+
+            if local_tracks is not None:
+                tracks = np.concatenate([tracks, local_tracks], axis=1)
+                visibility = np.concatenate([visibility, local_visibility], axis=1)
+                initial_points = tracks[0]
+
+                # Recompute Any4D score for all global + local points.
+                point_motion_score = bilinear_sample_map(
+                    motion_score_map,
+                    initial_points,
+                    src_hw=(track_h, track_w),
+                )
+
+                print(
+                    f"[LocalResample] Total points after local resampling: "
+                    f"{initial_points.shape[0]}"
+                )
 
     if args.dynamic_prior_path:
         prior = load_prob(args.dynamic_prior_path)
@@ -503,6 +954,49 @@ def main():
         & bg_condition
     ).astype(np.uint8)
 
+    # ------------------------------------------------------------
+    # 3.5 Optional depth-aware point connected component
+    # ------------------------------------------------------------
+    dynamic_labels_before_cc = dynamic_labels.copy()
+
+    if args.use_depth_cc:
+        if args.vggt_npz is None:
+            raise ValueError("--use_depth_cc requires --vggt_npz")
+
+        vggt_depth = load_vggt_depth(args.vggt_npz, args.vggt_ref_idx)
+        vggt_depth_resized = resize_to(vggt_depth, (track_h, track_w), cv2.INTER_LINEAR)
+
+        point_depth = bilinear_sample_map(
+            vggt_depth_resized,
+            initial_points,
+            src_hw=(track_h, track_w),
+        )
+
+        dynamic_labels, depth_cc_ids, depth_cc_valid = depth_aware_connected_component_filter(
+            points_xy=initial_points,
+            point_depth=point_depth,
+            point_scores=point_dynamic_prob,
+            dynamic_labels=dynamic_labels,
+            hw=(track_h, track_w),
+            radius=args.cc_radius,
+            depth_gate=args.cc_depth_gate,
+            score_gate=args.cc_score_gate,
+            min_component_points=args.cc_min_component_points,
+            min_dynamic_points=args.cc_min_dynamic_points,
+            min_dynamic_ratio=args.cc_min_dynamic_ratio,
+            min_mean_score=args.cc_min_mean_score,
+            propagate=args.cc_propagate,
+        )
+
+        print(
+            "[DepthCC] dynamic points before/after: "
+            f"{int(dynamic_labels_before_cc.sum())} -> {int(dynamic_labels.sum())}"
+        )
+
+    else:
+        point_depth = np.zeros_like(point_dynamic_prob, dtype=np.float32)
+        depth_cc_ids = np.full((initial_points.shape[0],), -1, dtype=np.int32)
+        depth_cc_valid = np.zeros((initial_points.shape[0],), dtype=np.uint8)
 
     # ------------------------------------------------------------
     # 4. Optional dense visualization/output
@@ -556,6 +1050,10 @@ def main():
         visible_ratio=visible_ratio.astype(np.float32),
         point_dynamic_prob=point_dynamic_prob.astype(np.float32),
         dynamic_labels=dynamic_labels.astype(np.uint8),
+        dynamic_labels_before_cc=dynamic_labels_before_cc.astype(np.uint8),
+        point_depth=point_depth.astype(np.float32),
+        depth_cc_ids=depth_cc_ids.astype(np.int32),
+        depth_cc_valid=depth_cc_valid.astype(np.uint8),
         track_hw=np.array([track_h, track_w], dtype=np.int32),
         original_hw=np.array(first_orig_hw, dtype=np.int32),
         resize_scale=np.array(scale, dtype=np.float32),
@@ -606,6 +1104,20 @@ def main():
         cv2.imwrite(str(out_dir / "cotracker_any4d_dynamic_overlay_original_size.png"), overlay_prob(orig_ref, prob_orig, (0, 0, 255), 0.45))
         cv2.imwrite(str(out_dir / "cotracker_any4d_dynamic_mask_original_size.png"), (mask_orig > 0.5).astype(np.uint8) * 255)
 
+    point_depth_norm = robust_normalize(point_depth, p_low=5.0, p_high=95.0)
+
+    depth_overlay = draw_score_overlay(
+        ref_bgr,
+        initial_points,
+        point_depth_norm,
+        radius=args.point_vis_radius,
+    )
+
+    cv2.imwrite(
+        str(out_dir / "point_vggt_depth_overlay.png"),
+        depth_overlay,
+    )
+
     summary = {
         "image_dir": str(args.image_dir),
         "any4d_npz": str(args.any4d_npz),
@@ -641,6 +1153,18 @@ def main():
         "bg_residual_score_thresh": args.bg_residual_score_thresh,
         "bg_residual_px_thresh": args.bg_residual_px_thresh,
         "bg_model_success_frames": int(bg_model_success.sum()),
+        "use_depth_cc": bool(args.use_depth_cc),
+        "cc_radius": args.cc_radius,
+        "cc_depth_gate": args.cc_depth_gate,
+        "cc_score_gate": args.cc_score_gate,
+        "cc_min_component_points": args.cc_min_component_points,
+        "cc_min_dynamic_points": args.cc_min_dynamic_points,
+        "cc_min_dynamic_ratio": args.cc_min_dynamic_ratio,
+        "cc_min_mean_score": args.cc_min_mean_score,
+        "cc_propagate": bool(args.cc_propagate),
+        "num_dynamic_points_before_cc": int(dynamic_labels_before_cc.sum()),
+        "num_dynamic_points_after_cc": int(dynamic_labels.sum()),
+        "num_valid_depth_cc_points": int(depth_cc_valid.sum()),
     }
     (out_dir / "cotracker_any4d_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
