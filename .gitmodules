@@ -1,0 +1,3 @@
+[submodule "third_party/DROID-W"]
+	path = third_party/DROID-W
+	url = https://github.com/MoyangLi00/DROID-W.git
