@@ -18,6 +18,10 @@ fi
 
 cd "$DROIDW_ROOT"
 
+echo "==== Update DROID-W submodules ===="
+git submodule sync --recursive
+git submodule update --init --recursive
+
 echo "==== 2. Install Python dependencies ===="
 python -m pip install -q \
   ninja pybind11 munch pyyaml tqdm scipy opencv-python imageio imageio-ffmpeg \
