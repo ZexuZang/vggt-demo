@@ -147,3 +147,39 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# Runtime outputs
+outputs/
+outputs_compare/
+third_party/DROID-W/Outputs/
+
+# Datasets
+data/
+datasets/
+Datasets/
+third_party/DROID-W/datasets/
+third_party/DROID-W/Datasets/
+
+# Checkpoints / weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+third_party/DROID-W/pretrained/
+third_party/Any4D/checkpoints/
+
+# Build artifacts
+build/
+*.egg-info/
+*.so
+__pycache__/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+*_build_log*.txt
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
