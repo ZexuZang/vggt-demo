@@ -1,0 +1,12 @@
+inherit_from: ./configs/Dynamic/Bonn/bonn_dynamic.yaml
+scene: bonn_person_tracking
+
+data:
+  input_folder: ROOT_FOLDER_PLACEHOLDER/rgbd_bonn_person_tracking
+
+ours_dynamic:
+  enable: true
+  static_weight_dir: /content/vggt-demo/outputs/droidw_ours_weights/person_tracking/static_weight_npy
+  sequential_names: true
+  alpha: 1.0
+  min_weight: 0.05
